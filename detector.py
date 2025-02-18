@@ -1,65 +1,95 @@
 import cv2
+from torch.xpu import device
 from ultralytics import YOLO
+import torch
+from sort import Sort
+import numpy as np
 
-cap = cv2.VideoCapture("naval.mp4")
-
-ret, frame = cap.read()
-object_count = 0
-
-model = YOLO("best.pt")
-names = model.names
-threshold = 0.5
-
-while ret:
-
-    results = model(frame)[0]
-    object_count = 0
-    index = 0
-
-    civil_ships = 0
-    battleships = 0
-
-    for result in results.boxes.data.tolist():
-        x1, y1, x2, y2, score, class_id = result
-
-        class_name = names[int(class_id)].upper()
-
-        if score > threshold:
-            # count += 1
-            index += 1
-            object_count += 1
-            x_center = int((x1 + x2) / 2)
-            y_center = int((y1 + y2) / 2)
+class ShipDetecor:
+    def __init__(self, device, path):
+        self.device = device
+        self.model = self.load_model()
+        self.names = self.model.names
+        self.path = path
+        self.sort = Sort(max_age=100, min_hits=8, iou_threshold=0.4)
 
 
+    def load_model(self):
+        model = YOLO("weights/ship_detector.pt")
+        model.fuse()
+        model.to(self.device)
+        return model
 
-            cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
-            # The "Target" point that the naval drone should aim for should be located at the bottom of the ship, since it should attack the lower part of the ship.
-            cv2.circle(frame, (x_center, y_center+80), 3, (0, 0, 255), thickness=cv2.FILLED)
-            cv2.putText(frame, f"{index}: {class_name}", (int(x1), int(y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.3, (0, 0, 255), 3, cv2.LINE_AA)
+    def results(self, model, frame):
+        results = model.predict(frame, conf=0.4)
+        return results
 
-            if names[int(class_id)] == "battleship":
-                battleships += 1
-            elif names[int(class_id)] == "civil_ship":
-                civil_ships += 1
+    def get_results(self, results):
+        arr = []
+        for result in results[0]:
+            bbox = result.boxes.xyxy.cpu().numpy()
+            conf = result.boxes.conf.cpu().numpy()
+            cls = result.boxes.cls.cpu().numpy()
 
-    cv2.rectangle(frame, (8, 15), (350, 25), (0, 0, 0), 20)
-    cv2.putText(frame, f"Total object count: {object_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            t_arr = [bbox[0][0], bbox[0][1], bbox[0][2], bbox[0][3], conf[0], cls[0]]
+            arr.append(t_arr)
 
-    cv2.rectangle(frame, (8, 55), (240, 65), (0, 0, 0), 20)
-    cv2.putText(frame, f"Battleships: {battleships}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        return np.array(arr)
 
-    cv2.rectangle(frame, (8, 95), (240, 105), (0, 0, 0), 20)
-    cv2.putText(frame, f"Civil ships: {civil_ships}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+    def draw_boxes(self, frame, bboxes, indicies, classes):
+        for bbox, index, clas in zip(bboxes, indicies, classes):
+            name = self.names[int(clas)]
 
-    cv2.imshow("Video", frame)
+            color = (0, 0, 0)
 
-    # out.write(frame)
-    ret, frame = cap.read()
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+            if clas == 1:
+                color = (0, 0, 255)
+            elif clas == 0:
+                color = (0, 255, 0)
 
-cap.release()
-# out.release()
-cv2.destroyAllWindows()
+            cv2.rectangle(frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
+            cv2.putText(frame, name, (int(bbox[0]), int(bbox[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
+        return frame
+
+
+
+    def __call__(self):
+
+
+        cap = cv2.VideoCapture(self.path)
+
+        assert cap.isOpened()
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+
+            results = self.results(self.model, frame)
+            arr = self.get_results(results)
+
+            if len(arr) == 0:
+                arr = np.empty((0, 5))
+
+            res = self.sort.update(arr)
+
+            bboxes = res[:, :-1]
+            indicies = res[:, -1].astype(int)
+            classes = arr[:, -1].astype(int)
+
+            frame = self.draw_boxes(frame, bboxes, indicies, classes)
+
+            cv2.imshow('Framw', frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+device = "mps" if torch.backends.mps.is_available() else "cpu"
+path = "civil_ship.mp4"
+ship_detector = ShipDetecor(device, path)
+ship_detector()
